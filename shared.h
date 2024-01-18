@@ -1,29 +1,55 @@
 #pragma once
 
 #include "sw_fwd.h"  // Forward declaration
-#include "weak.h"
 
 #include <cstddef>  // std::nullptr_t
-// https://en.cppreference.com/w/cpp/memory/shared_ptr
 
-template <typename T>
-class WeakPtr;
+class ControlBlockBase {
+public:
+    ControlBlockBase() : shared_count_(1) {
+    }
+    virtual ~ControlBlockBase() {
+    }
+    virtual void DeleteData() {
+    }
 
-template <typename T>
-class EnableSharedFromThis;
-
-template <class T, class Y = void>
-struct EnableIf {
-    typedef Y IsEnabled;
+    size_t shared_count_ = 0;
 };
 
-template <class T, class Enable = void>
-struct IsEnabledToShareFromThis : std::false_type {};
+template <typename T>
+class ControlBlockPointer : public ControlBlockBase {
+public:
+    ControlBlockPointer(T* ptr) : ptr_(ptr) {
+    }
+    virtual ~ControlBlockPointer() {
+        delete ptr_;
+    }
 
-template <class T>
-struct IsEnabledToShareFromThis<T, typename EnableIf<typename T::EnabledToShareFromThis>::IsEnabled>
-    : std::true_type {};
+private:
+    T* ptr_;
+};
 
+template <typename T>
+class ControlBlockInPlace : public ControlBlockBase {
+public:
+    template <typename... Args>
+    ControlBlockInPlace(Args&&... args) {
+        new (&buffer_) T(std::forward<Args>(args)...);
+    }
+
+    virtual ~ControlBlockInPlace() {
+        GetPtr()->~T();
+    }
+
+    T* GetPtr() {
+        return reinterpret_cast<T*>(&buffer_);
+    }
+
+private:
+    alignas(T) char buffer_[sizeof(T)];
+};
+
+// https://en.cppreference.com/w/cpp/memory/shared_ptr
 template <typename T>
 class SharedPtr {
 public:
@@ -40,12 +66,11 @@ public:
     SharedPtr(std::nullptr_t) : SharedPtr() {
     }
 
-    template <typename Y>
+    explicit SharedPtr(T* ptr) : ptr_(ptr), control_block_(new ControlBlockPointer<T>(ptr)) {
+    }
+
+    template <typename Y, std::enable_if_t<std::is_convertible_v<Y*, T*>, bool> = true>
     explicit SharedPtr(Y* ptr) : ptr_(ptr), control_block_(new ControlBlockPointer<Y>(ptr)) {
-        if constexpr (IsEnabledToShareFromThis<Y>()) {
-            ptr->ptr_ = ptr_;
-            ptr->control_block_ = control_block_;
-        }
     }
 
     SharedPtr(const SharedPtr& other) {
@@ -89,14 +114,8 @@ public:
 
     // Promote `WeakPtr`
     // #11 from https://en.cppreference.com/w/cpp/memory/shared_ptr/shared_ptr
-    explicit SharedPtr(const WeakPtr<T>& other) {
-        if (other.Expired()) {
-            throw BadWeakPtr();
-        }
-        ptr_ = other.ptr_;
-        control_block_ = other.control_block_;
-        IncrementSharedCount();
-    }
+    explicit SharedPtr(const WeakPtr<T>& other);
+
     ////////////////////////////////////////////////////////////////////////////////////////////////
     // `operator=`-s
 
@@ -131,12 +150,9 @@ public:
     ~SharedPtr() {
         if (control_block_) {
             control_block_->shared_count_--;
-            if (control_block_->shared_count_ == 0 && control_block_->weak_count_ == 0) {
-                control_block_->DeleteData();
+            if (control_block_->shared_count_ == 0) {
                 delete control_block_;
                 control_block_ = nullptr;
-            } else if (control_block_->shared_count_ == 0) {
-                control_block_->DeleteData();
             }
         }
     }
@@ -147,12 +163,9 @@ public:
     void Reset() {
         if (control_block_) {
             control_block_->shared_count_--;
-            if (control_block_->shared_count_ == 0 && control_block_->weak_count_ == 0) {
-                control_block_->DeleteData();
+            if (control_block_->shared_count_ == 0) {
                 delete control_block_;
                 control_block_ = nullptr;
-            } else if (control_block_->shared_count_ == 0) {
-                control_block_->DeleteData();
             }
         }
         control_block_ = nullptr;
@@ -198,14 +211,13 @@ public:
     }
 
 private:
-    inline void IncrementSharedCount() {
+    void IncrementSharedCount() {
         if (control_block_) {
             ++control_block_->shared_count_;
         }
     }
 
     T* ptr_;
-    ControlBlockBase* control_block_;
 
     template <typename Tp, typename... Args>
     friend SharedPtr<Tp> MakeShared(Args&&... args);
@@ -213,14 +225,7 @@ private:
     template <typename Tp>
     friend class SharedPtr;
 
-    template <typename Tp>
-    friend class WeakPtr;
-
-    template <typename Tp>
-    friend class EnableSharedFromThis;
-
-    template <typename Tp, typename Y>
-    friend bool operator==(const SharedPtr<Tp>& sp1, const SharedPtr<Y>& sp2);
+    ControlBlockBase* control_block_;
 };
 
 template <typename T, typename U>
@@ -233,65 +238,16 @@ SharedPtr<T> MakeShared(Args&&... args) {
     SharedPtr<T> shared;
     shared.ptr_ = ptr->GetPtr();
     shared.control_block_ = ptr;
-
-    if constexpr (IsEnabledToShareFromThis<T>()) {
-        (*shared.ptr_).ptr_ = shared.ptr_;
-        (*shared.ptr_).control_block_ = shared.control_block_;
-    }
-
     return shared;
-}
-
-template <typename T, typename Y>
-bool operator==(const SharedPtr<T>& sp1, const SharedPtr<Y>& sp2) {
-    return (sp1.ptr_ == sp2.ptr_ && sp1.control_block_ == sp2.control_block_);
 }
 
 // Look for usage examples in tests
 template <typename T>
 class EnableSharedFromThis {
 public:
-    typedef void EnabledToShareFromThis;
+    SharedPtr<T> SharedFromThis();
+    SharedPtr<const T> SharedFromThis() const;
 
-    SharedPtr<T> SharedFromThis() {
-        SharedPtr<T> sptr;
-        sptr.ptr_ = ptr_;
-        sptr.control_block_ = control_block_;
-        sptr.IncrementSharedCount();
-        return sptr;
-    }
-
-    SharedPtr<const T> SharedFromThis() const {
-        SharedPtr<const T> sptr;
-        sptr.ptr_ = ptr_;
-        sptr.control_block_ = control_block_;
-        sptr.IncrementSharedCount();
-        return sptr;
-    }
-
-    WeakPtr<T> WeakFromThis() noexcept {
-        WeakPtr<T> wptr;
-        wptr.ptr_ = ptr_;
-        wptr.control_block_ = control_block_;
-        wptr.IncrementWeakCount();
-        return wptr;
-    }
-
-    WeakPtr<const T> WeakFromThis() const noexcept {
-        WeakPtr<const T> wptr;
-        wptr.ptr_ = ptr_;
-        wptr.control_block_ = control_block_;
-        wptr.IncrementWeakCount();
-        return wptr;
-    }
-
-private:
-    ControlBlockBase* control_block_ = nullptr;
-    T* ptr_ = nullptr;
-
-    template <typename Tp>
-    friend class SharedPtr;
-
-    template <typename Tp, typename... Args>
-    friend SharedPtr<Tp> MakeShared(Args&&... args);
+    WeakPtr<T> WeakFromThis() noexcept;
+    WeakPtr<const T> WeakFromThis() const noexcept;
 };
